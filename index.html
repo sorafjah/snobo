@@ -59,6 +59,9 @@
   .swipeIcon .arrow::before { content:''; position:absolute; left:6px; top:0; width:6px; height:58px; background:rgba(255,255,255,.85); border-radius:3px; }
   .swipeIcon .arrow::after { content:''; position:absolute; left:0; bottom:0; border-left:9px solid transparent; border-right:9px solid transparent; border-top:16px solid rgba(255,255,255,.85); }
   @keyframes swipeDown { 0%{transform:translateY(0); opacity:0;} 15%{opacity:1;} 70%{transform:translateY(58px); opacity:1;} 100%{transform:translateY(62px); opacity:0;} }
+  @keyframes swipeUp { 0%{transform:translateY(58px); opacity:0;} 15%{opacity:1;} 70%{transform:translateY(0); opacity:1;} 100%{transform:translateY(-4px); opacity:0;} }
+  .swipeIcon.up .finger { animation-name:swipeUp; top:auto; bottom:0; }
+  .swipeIcon.up .arrow { transform:rotate(180deg); top:auto; bottom:6px; }
   #airGuide .cross { width:96px; height:96px; position:relative; }
   #airGuide .cross i { position:absolute; background:rgba(255,255,255,.9); border-radius:4px; }
   #airGuide .cross i.v { left:44px; top:6px; width:8px; height:84px; }
@@ -117,8 +120,8 @@
 <div id="comboPop"></div>
 
 <div class="guide" id="accelGuide">
-  <div class="swipeIcon"><div class="arrow"></div><div class="finger"></div></div>
-  <div class="bubble">下にスワイプで かそく！<small>れんぞくスワイプで もっと はやく</small></div>
+  <div class="swipeIcon up"><div class="arrow"></div><div class="finger"></div></div>
+  <div class="bubble">上にスワイプで かそく！<small>れんぞくスワイプで もっと はやく</small></div>
 </div>
 
 <div class="guide" id="airGuide">
@@ -187,24 +190,69 @@ window.addEventListener('resize', () => {
 });
 
 /* ---------- コース形状 ----------
-   z+方向へ滑走。groundY(z)で高さを定義し、メッシュも物理も同じ関数を使う */
-const LIP_Z = 112;        // ジャンプ台の先端
-const FLAT_Z = 210;       // 平地開始
-const WALL_Z = 300;       // フィニッシュ壁
-const FLAT_Y = -50.9;
+   z+方向へ滑走。groundY(z)で高さを定義し、メッシュも物理も同じ関数を使う。
+   ジャンプ台を3基連続で配置し、各台のあとに短いランディング〜助走を挟む。 */
+const KICKERS = [
+  { start:70,  lip:82,  landEnd:112 },
+  { start:150, lip:162, landEnd:192 },
+  { start:230, lip:242, landEnd:272 },
+];
+const LIP_Z   = KICKERS[0].lip;          // 最初の台（互換用・信号後の初期加速目安に使用）
+const FLAT_Z  = 300;                     // 平地（減速ゾーン）開始
+const WALL_Z  = 460;                     // フィニッシュ壁（減速ゾーンをゆったり確保）
+const FLAT_Y  = -74.4;
 
+// 各区間の「開始点の高さ」を事前計算しておき、groundYはその区間内だけを計算する
+const SEG_START_Y = [];
+(function precomputeSegments(){
+  let y = 0;
+  SEG_START_Y.push({ z:0, y });
+  for (const k of KICKERS){
+    y += -0.16 * (k.start - (SEG_START_Y[SEG_START_Y.length-1].z));
+    SEG_START_Y.push({ z:k.start, y });          // 助走終わり＝台の根本
+    const lipY = y + 4.2;
+    SEG_START_Y.push({ z:k.lip, y:lipY });        // 台の先端
+    const landY = lipY - 9.5 - 3.0;
+    SEG_START_Y.push({ z:k.landEnd, y:landY });   // 着地バーン終わり
+    y = landY;
+  }
+  const lastZ = SEG_START_Y[SEG_START_Y.length-1].z;
+  y += -0.16 * (FLAT_Z - lastZ);
+  SEG_START_Y.push({ z:FLAT_Z, y });
+  SEG_START_Y.push({ z:WALL_Z+40, y:FLAT_Y });
+})();
 function groundY(z){
-  if (z < 100) return -0.18 * z;                                  // 助走スロープ
-  if (z < LIP_Z) { const t = (z-100)/12; return -18 + 4.5*t*t; }  // キッカー(上向きカーブ)
-  if (z < 180) return -16 - (z-LIP_Z)*0.42;                       // ランディングバーン
-  if (z < FLAT_Z) { const t = z-180; return -44.56 - 0.42*t + 0.42*t*t/60; } // 平地へ緩和
-  return FLAT_Y;                                                  // 減速ゾーン
+  z = Math.max(0, z);
+  for (const k of KICKERS){
+    if (z >= k.start && z < k.lip){
+      const s = SEG_START_Y.find(s=>s.z===k.start).y;
+      const t = (z-k.start)/(k.lip-k.start);
+      return s + 4.2*t*t;
+    }
+    if (z >= k.lip && z < k.landEnd){
+      const lipY = SEG_START_Y.find(s=>s.z===k.lip).y;
+      const t = (z-k.lip)/(k.landEnd-k.lip);
+      return lipY - 9.5*t - 3.0*t*t;
+    }
+  }
+  // 直線区間：区間テーブルから前後を探して線形補間（減速ゾーンはゆるいカーブで合流）
+  for (let i=0;i<SEG_START_Y.length-1;i++){
+    const a = SEG_START_Y[i], b = SEG_START_Y[i+1];
+    if (z >= a.z && z <= b.z){
+      const t = (z-a.z)/Math.max(1e-6,(b.z-a.z));
+      // 減速ゾーンへの合流だけイーズアウトでなめらかに
+      const isFlat = (a.z === FLAT_Z);
+      const tt = isFlat ? (1-Math.pow(1-t,2)) : t;
+      return a.y + (b.y-a.y)*tt;
+    }
+  }
+  return FLAT_Y;
 }
 function groundSlope(z){ const e=0.25; return (groundY(z+e)-groundY(z-e))/(2*e); }
 
 /* 雪面メッシュ生成（両端をせり上げてバンク風に） */
 (function buildCourse(){
-  const W = 60, ZN = 340, XN = 24, zStep = (WALL_Z+40)/ZN;
+  const W = 60, ZN = 480, XN = 24, zStep = (WALL_Z+40)/ZN;
   const geo = new THREE.PlaneGeometry(W, WALL_Z+40, XN, ZN);
   geo.rotateX(-Math.PI/2);
   const pos = geo.attributes.position;
@@ -233,12 +281,17 @@ function groundSlope(z){ const e=0.25; return (groundY(z+e)-groundY(z-e))/(2*e);
   laneGeo.computeVertexNormals();
   scene.add(new THREE.Mesh(laneGeo, new THREE.MeshLambertMaterial({ color:0xe4f1fb })));
 
-  // キッカー先端の赤ライン
-  const lipMark = new THREE.Mesh(new THREE.BoxGeometry(6, 0.15, 0.5),
-    new THREE.MeshLambertMaterial({ color:0xff6b6b }));
-  lipMark.position.set(0, groundY(LIP_Z)+0.1, LIP_Z-0.3);
-  lipMark.rotation.x = -Math.atan(groundSlope(LIP_Z));
-  scene.add(lipMark);
+  // キッカー先端の赤ライン（3台ぶん）
+  for (const k of KICKERS){
+    const lipMark = new THREE.Mesh(new THREE.BoxGeometry(6, 0.15, 0.5),
+      new THREE.MeshLambertMaterial({ color:0xff6b6b }));
+    lipMark.position.set(0, groundY(k.lip)+0.1, k.lip-0.3);
+    lipMark.rotation.x = -Math.atan(groundSlope(k.lip));
+    scene.add(lipMark);
+    const numBanner = makeBanner(String(KICKERS.indexOf(k)+1), 2.2, 2.2, '#ffb340', '#ffffff');
+    numBanner.position.set(-4.5, groundY(k.lip)+2.6, k.lip-1);
+    scene.add(numBanner);
+  }
 })();
 
 /* ---------- テキスト入りバナー ---------- */
@@ -291,7 +344,7 @@ const crowdGroup = new THREE.Group();
       new THREE.MeshBasicMaterial({ color:0x333333 }));
     eye.position.set(side*-0.2, 0.15, -0.45); g.add(eye);
     const eye2 = eye.clone(); eye2.position.x = side*-0.45; g.add(eye2);
-    g.position.set(side*(9.5+Math.random()*4), 0, 215+Math.random()*80);
+    g.position.set(side*(9.5+Math.random()*4), 0, 320+Math.random()*130);
     g.position.y = groundY(g.position.z) + 0.55 + Math.pow((Math.abs(g.position.x)-8)/10,2.2)*6;
     g.userData.baseY = g.position.y;
     g.userData.ph = Math.random()*Math.PI*2;
@@ -304,9 +357,9 @@ const crowdGroup = new THREE.Group();
 (function(){
   const trunkMat = new THREE.MeshLambertMaterial({ color:0x9a7050 });
   const leafMat = new THREE.MeshLambertMaterial({ color:0x7fc8a0 });
-  for (let i=0; i<26; i++){
+  for (let i=0; i<40; i++){
     const side = i%2 ? 1 : -1;
-    const z = 6 + Math.random()*260;
+    const z = 6 + Math.random()*440;
     const x = side*(11+Math.random()*7);
     const g = new THREE.Group();
     const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.25,0.35,1.6,7), trunkMat);
@@ -325,19 +378,23 @@ const crowdGroup = new THREE.Group();
     g.position.set(x, groundY(z) + Math.pow((Math.abs(x)-8)/10,2.2)*6, z);
     scene.add(g);
   }
-  // のぼり旗（ランディング横）
+  // のぼり旗（各キッカーのランディング横）
   const flagCols = [0xff8fb0, 0x7ec8f5, 0xffd76e];
-  for (let i=0; i<8; i++){
-    const side = i%2?1:-1;
-    const z = 125 + i*10;
-    const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.08,0.08,3.4,6),
-      new THREE.MeshLambertMaterial({ color:0xffffff }));
-    const fl = new THREE.Mesh(new THREE.PlaneGeometry(1.5,0.9),
-      new THREE.MeshLambertMaterial({ color: flagCols[i%3], side:THREE.DoubleSide }));
-    fl.position.set(side*-0.8, 1.2, 0);
-    const g = new THREE.Group(); g.add(pole); g.add(fl);
-    g.position.set(side*7.5, groundY(z)+1.7, z);
-    scene.add(g);
+  let fi = 0;
+  for (const k of KICKERS){
+    for (let i=0; i<4; i++){
+      const side = i%2?1:-1;
+      const z = k.lip + 6 + i*7;
+      const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.08,0.08,3.4,6),
+        new THREE.MeshLambertMaterial({ color:0xffffff }));
+      const fl = new THREE.Mesh(new THREE.PlaneGeometry(1.5,0.9),
+        new THREE.MeshLambertMaterial({ color: flagCols[fi%3], side:THREE.DoubleSide }));
+      fl.position.set(side*-0.8, 1.2, 0);
+      const g = new THREE.Group(); g.add(pole); g.add(fl);
+      g.position.set(side*7.5, groundY(z)+1.7, z);
+      scene.add(g);
+      fi++;
+    }
   }
 })();
 
@@ -350,79 +407,101 @@ const model = new THREE.Group();       // 本体
 piyo.add(tiltG); tiltG.add(spinYG); spinYG.add(spinXG); spinXG.add(model);
 scene.add(piyo);
 
-(function buildPiyo(){
-  const yellow = new THREE.MeshLambertMaterial({ color:0xffe45c });
-  const orange = new THREE.MeshLambertMaterial({ color:0xff9d42 });
-  const black  = new THREE.MeshBasicMaterial({ color:0x3a3a3a });
+// 腕・脚を外部から動かせるよう公開しておく（腕振り・膝曲げ演出用）
+const limbs = { armL:null, armR:null, legL:null, legR:null, head:null };
+
+(function buildHuman(){
+  // ---- 配色（視認性重視：彩度・明度差をはっきりつける） ----
+  const jacket = new THREE.MeshLambertMaterial({ color:0xff5252 });  // 燃えるような赤（ジャケット）
+  const pants  = new THREE.MeshLambertMaterial({ color:0x2255dd });  // くっきり青（パンツ）
+  const skin   = new THREE.MeshLambertMaterial({ color:0xffd6a8 });  // 肌
   const white  = new THREE.MeshLambertMaterial({ color:0xffffff });
-  const pink   = new THREE.MeshLambertMaterial({ color:0xffb3c8 });
+  const black  = new THREE.MeshBasicMaterial({ color:0x2b2b2b });
+  const helmet = new THREE.MeshLambertMaterial({ color:0xffe600 });  // 黄色いヘルメット
+  const glove  = new THREE.MeshLambertMaterial({ color:0x222222 });
+  const boot   = new THREE.MeshLambertMaterial({ color:0x1a1a1a });
 
-  const body = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 16), yellow);
-  body.scale.set(1, 1.06, 1); body.position.y = 1.05;
-  model.add(body);
+  // r128にはCapsuleGeometryが無いため、円柱＋両端球でカプセル状のグループを作る簡易ヘルパー
+  function makeCapsule(radius, length, mat){
+    const g = new THREE.Group();
+    const cyl = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, length, 10), mat);
+    g.add(cyl);
+    const capTop = new THREE.Mesh(new THREE.SphereGeometry(radius, 10, 8), mat);
+    capTop.position.y = length/2; g.add(capTop);
+    const capBot = new THREE.Mesh(new THREE.SphereGeometry(radius, 10, 8), mat);
+    capBot.position.y = -length/2; g.add(capBot);
+    return g;
+  }
 
-  // 羽
-  for (const s of [-1,1]){
-    const wing = new THREE.Mesh(new THREE.SphereGeometry(0.42, 12, 10), yellow);
-    wing.scale.set(0.5, 0.95, 0.72);
-    wing.position.set(s*0.95, 1.0, -0.1);
-    wing.rotation.z = s*-0.45;
-    model.add(wing);
+  // ---- 頭部グループ ----
+  const head = new THREE.Group();
+  head.position.y = 1.62;
+  const face = new THREE.Mesh(new THREE.SphereGeometry(0.32, 16, 14), skin);
+  head.add(face);
+  const helm = new THREE.Mesh(new THREE.SphereGeometry(0.35, 16, 14, 0, Math.PI*2, 0, Math.PI*0.62), helmet);
+  helm.position.y = 0.05;
+  head.add(helm);
+  // ゴーグル
+  const band = new THREE.Mesh(new THREE.TorusGeometry(0.33, 0.055, 8, 20), white);
+  band.rotation.x = Math.PI/2 - 0.15; band.position.y = 0.02;
+  head.add(band);
+  const lens = new THREE.Mesh(new THREE.BoxGeometry(0.44, 0.16, 0.08),
+    new THREE.MeshLambertMaterial({ color:0x36e0ff, emissive:0x0b6fa0, emissiveIntensity:0.4 }));
+  lens.position.set(0, 0.02, 0.3); lens.rotation.x = -0.15;
+  head.add(lens);
+  model.add(head);
+  limbs.head = head;
+
+  // ---- 胴体 ----
+  const torso = makeCapsule(0.28, 0.55, jacket);
+  torso.position.y = 1.12;
+  model.add(torso);
+  // ジャケットの白ライン（視認性アクセント）
+  const stripe = new THREE.Mesh(new THREE.CylinderGeometry(0.285, 0.285, 0.1, 16), white);
+  stripe.position.y = 1.0;
+  model.add(stripe);
+
+  // ---- 腕（付け根グループごとに回転できるように） ----
+  function buildArm(side){
+    const g = new THREE.Group();
+    g.position.set(side*0.36, 1.42, 0);
+    const upper = makeCapsule(0.1, 0.32, jacket);
+    upper.position.y = -0.2; upper.rotation.z = side*-0.15;
+    g.add(upper);
+    const hand = new THREE.Mesh(new THREE.SphereGeometry(0.12, 10, 8), glove);
+    hand.position.y = -0.46;
+    g.add(hand);
+    model.add(g);
+    return g;
   }
-  // とさか的な羽毛
-  for (let k=0;k<3;k++){
-    const tuft = new THREE.Mesh(new THREE.ConeGeometry(0.09, 0.32, 6), yellow);
-    tuft.position.set((k-1)*0.16, 2.06, -0.05);
-    tuft.rotation.x = (k-1)*0.25; tuft.rotation.z = (k-1)*-0.3;
-    model.add(tuft);
+  limbs.armL = buildArm(-1);
+  limbs.armR = buildArm(1);
+
+  // ---- 脚 ----
+  function buildLeg(side){
+    const g = new THREE.Group();
+    g.position.set(side*0.16, 0.82, 0);
+    const upper = makeCapsule(0.13, 0.34, pants);
+    upper.position.y = -0.2;
+    g.add(upper);
+    const bt = new THREE.Mesh(new THREE.BoxGeometry(0.24, 0.2, 0.36), boot);
+    bt.position.y = -0.42;
+    g.add(bt);
+    model.add(g);
+    return g;
   }
-  // くちばし
-  const beak = new THREE.Mesh(new THREE.ConeGeometry(0.16, 0.34, 8), orange);
-  beak.rotation.x = Math.PI/2;
-  beak.position.set(0, 1.22, 0.98);
-  model.add(beak);
-  // ほっぺ
-  for (const s of [-1,1]){
-    const ch = new THREE.Mesh(new THREE.SphereGeometry(0.13, 8, 8), pink);
-    ch.scale.z = 0.4; ch.position.set(s*0.5, 1.08, 0.83);
-    model.add(ch);
-  }
-  // ゴーグル：バンド＋レンズ
-  const band = new THREE.Mesh(new THREE.TorusGeometry(0.95, 0.07, 8, 24), white);
-  band.rotation.x = Math.PI/2 - 0.28;
-  band.position.y = 1.5;
-  model.add(band);
-  const lensFrame = new THREE.Mesh(new THREE.BoxGeometry(1.15, 0.42, 0.16), white);
-  lensFrame.position.set(0, 1.52, 0.86); lensFrame.rotation.x = -0.28;
-  model.add(lensFrame);
-  const lens = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.3, 0.1),
-    new THREE.MeshLambertMaterial({ color:0x7fd4ff, emissive:0x2277aa, transparent:true, opacity:0.85 }));
-  lens.position.set(0, 1.52, 0.93); lens.rotation.x = -0.28;
-  model.add(lens);
-  // レンズ越しの目
-  for (const s of [-1,1]){
-    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.085, 8, 8), black);
-    eye.position.set(s*0.3, 1.52, 0.9);
-    model.add(eye);
-  }
-  // ブーツ
-  for (const s of [-1,1]){
-    const boot = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.26, 0.44), orange);
-    boot.position.set(s*0.42, 0.24, 0);
-    model.add(boot);
-  }
-  // スノーボード（ミント×白ストライプ）
-  const board = new THREE.Mesh(new THREE.BoxGeometry(2.5, 0.12, 0.72),
-    new THREE.MeshLambertMaterial({ color:0x8fe8c8 }));
-  board.position.y = 0.08;
-  // 先端の反り
-  board.geometry.translate(0,0,0);
+  limbs.legL = buildLeg(-1);
+  limbs.legR = buildLeg(1);
+
+  // ---- スノーボード（白×赤、視認性の高いはっきりコントラスト） ----
+  const board = new THREE.Mesh(new THREE.BoxGeometry(2.5, 0.12, 0.72), white);
+  board.position.y = 0.14;
   model.add(board);
-  const stripe = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.03, 0.2), white);
-  stripe.position.y = 0.155; model.add(stripe);
-  const noseL = new THREE.Mesh(new THREE.SphereGeometry(0.36, 8, 8),
-    new THREE.MeshLambertMaterial({ color:0x8fe8c8 }));
-  noseL.scale.set(1, 0.18, 1); noseL.position.set(-1.25, 0.13, 0); model.add(noseL);
+  const boardStripe = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.04, 0.24),
+    new THREE.MeshLambertMaterial({ color:0xff5252 }));
+  boardStripe.position.y = 0.21; model.add(boardStripe);
+  const noseL = new THREE.Mesh(new THREE.SphereGeometry(0.36, 8, 8), white);
+  noseL.scale.set(1, 0.18, 1); noseL.position.set(-1.25, 0.19, 0); model.add(noseL);
   const noseR = noseL.clone(); noseR.position.x = 1.25; model.add(noseR);
 
   // ちょいスノボスタンス（体を少し斜めに）
@@ -688,13 +767,15 @@ const G = {
   timeScale: 1,
   slowmo: false,
   signalTimer: null, signalStep: 0, signalArmed: false,
-  accelUntilZ: 88,
+  accelUntilZ: KICKERS[0].start - 10,
   guideT: 0,
   crashed: false,
   resultShown: false,
   celebT: 0, crashT: 0,
   stopped: false,
   wobble: 0,
+  curKicker: null,
+  usedKickers: new Set(),
 };
 
 function resetGame(){
@@ -709,6 +790,8 @@ function resetGame(){
   G.timeScale = 1; G.slowmo = false;
   G.crashed = false; G.resultShown = false; G.stopped = false;
   G.celebT = 0; G.crashT = 0; G.wobble = 0;
+  G.curKicker = null; G.usedKickers = new Set();
+  if (limbs.armL && limbs.armR){ limbs.armL.rotation.z = 0; limbs.armR.rotation.z = 0; }
   $('scoreVal').textContent = '0';
   $('resultPanel').classList.remove('show');
   setGuide('accelGuide', false); setGuide('airGuide', false); setGuide('brakeGuide', false);
@@ -794,7 +877,7 @@ function onUp(x, y){
 function handleSwipe(dx, dy){
   switch (G.phase){
     case 'accel':
-      if (dy > SWIPE_MIN*0.7 && Math.abs(dy) > Math.abs(dx)*0.8){
+      if (dy < -SWIPE_MIN*0.7 && Math.abs(dy) > Math.abs(dx)*0.8){
         G.spd = Math.min(34, G.spd + 3.4);
         SFX.push();
         burstSpray(piyo.position.x, piyo.position.y, piyo.position.z-0.5, 5, 0.7);
@@ -806,7 +889,7 @@ function handleSwipe(dx, dy){
       break;
     case 'runout':
       if (dy > SWIPE_MIN*0.7){
-        G.spd = Math.max(0, G.spd - 5.4);
+        G.spd = Math.max(0, G.spd - 3.6);
         SFX.brake();
         burstSpray(piyo.position.x, piyo.position.y, piyo.position.z+0.6, 12, 1.1);
         G.wobble = 0.25;
@@ -865,9 +948,12 @@ function landNow(){
   const off = Math.max(offX, offY);
   G.airRotXT = nx; G.airRotYT = ny;
 
-  G.phase = 'runout';
+  const isLastKicker = G.curKicker === KICKERS[KICKERS.length-1];
+  G.phase = isLastKicker ? 'runout' : 'ride';
   G.slowmo = false; G.timeScale = 1;
   G.vy = 0;
+  // 腕をニュートラルに戻す
+  if (limbs.armL && limbs.armR){ limbs.armL.rotation.z = 0; limbs.armR.rotation.z = 0; }
   SFX.land();
   burstSpray(piyo.position.x, piyo.position.y, piyo.position.z, 16, 1.4);
 
@@ -889,7 +975,7 @@ function landNow(){
   }
   $('scoreVal').textContent = G.score;
   setGuide('airGuide', false);
-  setGuide('brakeGuide', true);
+  if (isLastKicker) setGuide('brakeGuide', true);
 }
 
 function startCrash(){
@@ -910,7 +996,7 @@ function startStop(){
   SFX.cheer(true);
   burstConfetti(piyo.position.x, piyo.position.y+3, piyo.position.z, 120);
   setBgmVolume(0.25);
-  setTimeout(showResult, 2400);
+  setTimeout(showResult, 4200);
 }
 function crashRecover(){
   // 失敗でも前向きに：ひと呼吸おいて歓声＆ジャンプ
@@ -918,7 +1004,7 @@ function crashRecover(){
   SFX.cheer(true);
   showCenter('ドンマイ！ ナイスチャレンジ！');
   burstConfetti(piyo.position.x, piyo.position.y+3, piyo.position.z, 70);
-  setTimeout(showResult, 2400);
+  setTimeout(showResult, 4200);
 }
 function showResult(){
   if (G.resultShown) return;
@@ -974,7 +1060,7 @@ function updateCamera(dtReal){
 
 /* ---------- メインループ ---------- */
 let lastT = performance.now();
-const GRAV = 30;
+const GRAV = 15;   // ふんわり優雅な滞空にするため重力を弱め
 
 function tick(now){
   requestAnimationFrame(tick);
@@ -1002,7 +1088,7 @@ function tick(now){
     if (G.phase === 'accel'){
       G.guideT += dt;
       if (G.guideT > 4.5 || G.z > 60) setGuide('accelGuide', false);  // ガイドは先にフェードアウト
-      if (G.z > G.accelUntilZ) G.phase = 'ride';                      // スワイプ受付はキッカー手前まで
+      if (G.z > G.accelUntilZ) G.phase = 'ride';                      // スワイプ受付は最初の台手前まで
     }
     // プッシュしゃがみ戻し
     model.position.y += (0 - model.position.y) * Math.min(1, 10*dt);
@@ -1011,10 +1097,13 @@ function tick(now){
     // カービングっぽい揺れ
     model.rotation.z = Math.sin(now*0.004) * 0.05;
 
-    // 踏み切り
-    if (G.z >= LIP_Z){
+    // 踏み切り（まだ使っていない台のリップに到達したらジャンプ）
+    const nextK = KICKERS.find(k => !G.usedKickers.has(k));
+    if (nextK && G.z >= nextK.lip){
       G.phase = 'air';
-      G.vy = G.spd * 0.72;   // 踏み切り角 ≒ 36°ぶんの上向き速度
+      G.curKicker = nextK;
+      G.usedKickers.add(nextK);
+      G.vy = G.spd * 0.62;   // ふんわり高く上がる踏み切り角
       G.comboN = 0;
       SFX.jump();
       setGuide('airGuide', true);
@@ -1027,21 +1116,29 @@ function tick(now){
     G.vy -= GRAV * dt;
     G.y += G.vy * dt;
 
-    // 回転の追従（きびきび）
-    const rate = 11.5;   // rad/s ≒ 660°/s
+    // 回転の追従（ゆったり優雅に。速い技ほど時間はかかるが着地まで余裕がある）
+    const rate = 5.2;   // rad/s ≒ 300°/s
     const dxr = G.airRotXT - spinXG.rotation.x;
     spinXG.rotation.x += Math.sign(dxr) * Math.min(Math.abs(dxr), rate*dt);
     const dyr = G.airRotYT - spinYG.rotation.y;
     spinYG.rotation.y += Math.sign(dyr) * Math.min(Math.abs(dyr), rate*dt);
 
-    // 着地が近づいたらスローモー
+    // 腕を大きく広げて優雅な姿勢に（宙にいる間ずっと）
+    if (limbs.armL && limbs.armR){
+      const spread = 0.9;
+      limbs.armL.rotation.z += (spread - limbs.armL.rotation.z) * Math.min(1, 4*dt);
+      limbs.armR.rotation.z += (-spread - limbs.armR.rotation.z) * Math.min(1, 4*dt);
+    }
+
+    // 着地が近づいたらスローモー（優雅に魅せるため早めに入る）
     const h = G.y - groundY(G.z);
-    if (G.vy < 0 && h < 7 && !G.slowmo && G.z > LIP_Z+4){
+    const lipZ = G.curKicker ? G.curKicker.lip : LIP_Z;
+    if (G.vy < 0 && h < 9 && !G.slowmo && G.z > lipZ+4){
       G.slowmo = true;
       setGuide('airGuide', false);
     }
     // 着地
-    if (G.vy < 0 && G.y <= groundY(G.z) && G.z > LIP_Z+3){
+    if (G.vy < 0 && G.y <= groundY(G.z) && G.z > lipZ+3){
       G.y = groundY(G.z);
       landNow();
     }
@@ -1056,7 +1153,7 @@ function tick(now){
 
     const sl = groundSlope(G.z);
     G.spd += (-sl) * 12 * dt;
-    G.spd -= (1.4 + G.spd*0.03) * dt;       // 自然減速は弱め→ブレーキ必須
+    G.spd -= (0.8 + G.spd*0.018) * dt;      // 自然減速はかなり弱め→ブレーキで距離をかけて止める
     G.spd = Math.max(0, G.spd);
     G.z += G.spd * dt;
     G.y = groundY(G.z);
@@ -1099,7 +1196,7 @@ function tick(now){
   else if (G.phase === 'result'){
     G.celebT += dt;
     // ぴよ喜びジャンプ（3回ホップ）
-    const hop = Math.abs(Math.sin(G.celebT * 5.5)) * (G.celebT < 2.4 ? 0.9 : 0.2);
+    const hop = Math.abs(Math.sin(G.celebT * 5.5)) * (G.celebT < 3.6 ? 0.9 : 0.2);
     model.position.y = hop;
     if (G.celebT % 0.9 < dt*1.1) burstConfetti(piyo.position.x, piyo.position.y+3.5, piyo.position.z, 14);
   }
